@@ -724,6 +724,29 @@ app.get("/", (req, res) => {
   });
 });
 
+// Unknown routes -> 404
+app.use((req, res) => {
+  res.status(404).send({
+    msg: "Route not found!",
+  });
+});
+
+// Centralized error handler. It never exposes stack traces or
+// other internal details to the client.
+app.use((error, req, res, next) => {
+  // The client sent a body that is not valid JSON.
+  if (error.type === "entity.parse.failed") {
+    return res.status(400).send({
+      msg: "Invalid JSON in request body!",
+    });
+  }
+
+  console.error(error);
+  res.status(500).send({
+    msg: "Something went wrong! Please try again later.",
+  });
+});
+
 // Start Server
 app.listen(PORT, () => {
   console.log(`StudioSpace server running on port ${PORT}`);
