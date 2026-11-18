@@ -67,8 +67,10 @@ async function api(path, { method = "GET", body, jar, headers = {} } = {}) {
   return { status: res.status, data, headers: res.headers, raw: text };
 }
 
-// Alice's session cookie jar, shared by the later stages.
-const jar = createJar();
+// Session cookie jars shared by the later stages.
+const jar = createJar(); // Alice
+const bobJar = createJar(); // Bob
+let bookingStudioId = null; // studio used by the booking tests
 
 // ============================================================
 console.log("\n--- Stage 1: BetterAuth authentication ---");
@@ -188,7 +190,6 @@ console.log("\n--- Stage 2: studio APIs secured with authentication ---");
   check("DELETE /studio without session -> 401", unauthDelete.status === 401, `got ${unauthDelete.status}`);
 
   // --- second user (Bob) ---
-  const bobJar = createJar();
   let bobAuth = await api("/api/auth/sign-up/email", {
     method: "POST",
     jar: bobJar,
@@ -295,6 +296,117 @@ console.log("\n--- Stage 2: studio APIs secured with authentication ---");
 
   const bobDelete = await api(`/studio/${bobStudioId}`, { method: "DELETE", jar: bobJar });
   check("Bob deletes his own studio", bobDelete.status === 200, `got ${bobDelete.status}`);
+}
+
+// ============================================================
+console.log("\n--- Stage 3: booking APIs ---");
+{
+  const aliceEmail = "alice@example.com";
+  const bobEmail = "bob@example.com";
+
+  // --- authentication required ---
+  const unauthBook = await api("/bookings", {
+    method: "POST",
+    body: { studioId: "000000000000000000000000", bookingDate: "2027-01-01", startTime: "10:00", endTime: "12:00" },
+  });
+  check("POST /bookings without session -> 401", unauthBook.status === 401, `got ${unauthBook.status}`);
+
+  const unauthMyBookings = await api(`/my-bookings/${aliceEmail}`);
+  check("GET /my-bookings without session -> 401", unauthMyBookings.status === 401, `got ${unauthMyBookings.status}`);
+
+  const unauthCancel = await api("/bookings/000000000000000000000000/cancel", { method: "PATCH" });
+  check("PATCH /bookings/:id/cancel without session -> 401", unauthCancel.status === 401, `got ${unauthCancel.status}`);
+
+  // --- a studio to book (stages 2 deleted its studios) ---
+  const studioRes = await api("/add-studio", {
+    method: "POST",
+    jar,
+    body: { title: "Sunset Recording Booth", category: "Music Studio", hourlyRate: 20, location: "Sylhet", maxCapacity: 4 },
+  });
+  check("studio created for booking tests", studioRes.status === 201, `got ${studioRes.status} ${studioRes.raw}`);
+  bookingStudioId = studioRes.data?.insertedId;
+
+  // --- create a booking ---
+  const bookingRes = await api("/bookings", {
+    method: "POST",
+    jar,
+    body: {
+      studioId: bookingStudioId,
+      bookingDate: "2027-03-10",
+      startTime: "10:00",
+      endTime: "12:30",
+      // these must all be ignored:
+      userEmail: "attacker@example.com",
+      userName: "Hacker",
+      totalPrice: 1,
+      status: "Confirmed",
+    },
+  });
+  check("POST /bookings with session -> 201", bookingRes.status === 201, `got ${bookingRes.status} ${bookingRes.raw}`);
+  const bookingId = bookingRes.data?.insertedId;
+
+  const booking = bookingRes.data?.booking;
+  check("new booking status is Pending", booking?.status === "Pending", `got ${booking?.status}`);
+  check("booking user comes from the session", booking?.userEmail === aliceEmail, `got ${booking?.userEmail}`);
+  check("booking user name comes from the session", booking?.userName === "Alice Owner", `got ${booking?.userName}`);
+  check("total price calculated on server (20 * 2.5 = 50)", booking?.totalPrice === 50, `got ${booking?.totalPrice}`);
+
+  // --- read own bookings ---
+  const myBookings = await api(`/my-bookings/${aliceEmail}`, { jar });
+  check("owner can read own bookings", myBookings.status === 200 && Array.isArray(myBookings.data) && myBookings.data.some((b) => String(b._id) === String(bookingId)), `got ${myBookings.status}`);
+
+  const otherBookings = await api(`/my-bookings/${bobEmail}`, { jar });
+  check("reading another user's bookings -> 403", otherBookings.status === 403, `got ${otherBookings.status}`);
+
+  // --- input validation ---
+  const missing = await api("/bookings", { method: "POST", jar, body: { studioId: bookingStudioId } });
+  check("missing booking fields -> 400", missing.status === 400, `got ${missing.status}`);
+
+  const badStudio = await api("/bookings", { method: "POST", jar, body: { studioId: "not-an-id", bookingDate: "2027-03-10", startTime: "10:00", endTime: "12:00" } });
+  check("invalid studio id -> 400", badStudio.status === 400, `got ${badStudio.status}`);
+
+  const unknownStudio = await api("/bookings", { method: "POST", jar, body: { studioId: "000000000000000000000000", bookingDate: "2027-03-10", startTime: "10:00", endTime: "12:00" } });
+  check("unknown studio -> 404", unknownStudio.status === 404, `got ${unknownStudio.status}`);
+
+  const badDate = await api("/bookings", { method: "POST", jar, body: { studioId: bookingStudioId, bookingDate: "10-03-2027", startTime: "10:00", endTime: "12:00" } });
+  check("invalid booking date -> 400", badDate.status === 400, `got ${badDate.status}`);
+
+  const badTime = await api("/bookings", { method: "POST", jar, body: { studioId: bookingStudioId, bookingDate: "2027-03-10", startTime: "10am", endTime: "12:00" } });
+  check("invalid start time -> 400", badTime.status === 400, `got ${badTime.status}`);
+
+  const badRange = await api("/bookings", { method: "POST", jar, body: { studioId: bookingStudioId, bookingDate: "2027-03-10", startTime: "12:00", endTime: "10:00" } });
+  check("end time before start time -> 400", badRange.status === 400, `got ${badRange.status}`);
+
+  // --- cancel rules ---
+  const bobBooking = await api("/bookings", {
+    method: "POST",
+    jar: bobJar,
+    body: { studioId: bookingStudioId, bookingDate: "2027-03-11", startTime: "09:00", endTime: "11:00" },
+  });
+  check("Bob can create a booking", bobBooking.status === 201, `got ${bobBooking.status} ${bobBooking.raw}`);
+  const bobBookingId = bobBooking.data?.insertedId;
+
+  const crossCancel = await api(`/bookings/${bobBookingId}/cancel`, { method: "PATCH", jar });
+  check("cancelling someone else's booking -> 403", crossCancel.status === 403, `got ${crossCancel.status}`);
+
+  const badCancelId = await api("/bookings/not-an-id/cancel", { method: "PATCH", jar });
+  check("cancel invalid booking id -> 400", badCancelId.status === 400, `got ${badCancelId.status}`);
+
+  const unknownCancel = await api("/bookings/000000000000000000000000/cancel", { method: "PATCH", jar });
+  check("cancel unknown booking -> 404", unknownCancel.status === 404, `got ${unknownCancel.status}`);
+
+  const cancelRes = await api(`/bookings/${bookingId}/cancel`, { method: "PATCH", jar });
+  check("owner cancels own pending booking -> 200", cancelRes.status === 200, `got ${cancelRes.status} ${cancelRes.raw}`);
+
+  const afterCancel = await api(`/my-bookings/${aliceEmail}`, { jar });
+  const cancelled = Array.isArray(afterCancel.data) ? afterCancel.data.find((b) => String(b._id) === String(bookingId)) : null;
+  check("booking status becomes Cancelled", cancelled?.status === "Cancelled", `got ${cancelled?.status}`);
+
+  const cancelAgain = await api(`/bookings/${bookingId}/cancel`, { method: "PATCH", jar });
+  check("cancelling twice -> 409", cancelAgain.status === 409, `got ${cancelAgain.status}`);
+
+  // cleanup: Bob cancels his booking so no stray bookings remain
+  await api(`/bookings/${bobBookingId}/cancel`, { method: "PATCH", jar: bobJar });
 }
 
 // ---- results ----

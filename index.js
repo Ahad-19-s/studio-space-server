@@ -7,6 +7,7 @@ import { auth } from "./auth.js";
 import {
   connectToMongoDB,
   studioCollection,
+  bookingCollection,
 } from "./db.js";
 
 // Kept for backwards compatibility (the connection now lives in db.js).
@@ -359,6 +360,190 @@ app.delete("/studio/:id", requireAuth, async (req, res) => {
     console.error(error);
     res.status(500).send({
       msg: "Failed to delete studio!",
+    });
+  }
+});
+
+// ---- Booking helpers ----
+const DATE_PATTERN = /^\d{4}-\d{2}-\d{2}$/;
+const TIME_PATTERN = /^([01]\d|2[0-3]):[0-5]\d$/;
+
+// Converts "HH:MM" to minutes since midnight.
+function toMinutes(time) {
+  const [hours, minutes] = time.split(":").map(Number);
+  return hours * 60 + minutes;
+}
+
+// Create a new booking (authenticated users only).
+// Identity and price always come from the server, never from the client.
+app.post("/bookings", requireAuth, async (req, res) => {
+  try {
+    const user = req.user;
+    const { studioId, bookingDate, startTime, endTime } = req.body || {};
+
+    if (!studioId || !bookingDate || !startTime || !endTime) {
+      return res.status(400).send({
+        msg: "Studio ID, booking date, start time and end time are required!",
+      });
+    }
+
+    if (!ObjectId.isValid(studioId)) {
+      return res.status(400).send({
+        msg: "Invalid studio ID!",
+      });
+    }
+
+    if (!DATE_PATTERN.test(bookingDate) || Number.isNaN(Date.parse(bookingDate))) {
+      return res.status(400).send({
+        msg: "Booking date must be a valid date in YYYY-MM-DD format!",
+      });
+    }
+
+    if (!TIME_PATTERN.test(startTime) || !TIME_PATTERN.test(endTime)) {
+      return res.status(400).send({
+        msg: "Start time and end time must use the HH:MM format!",
+      });
+    }
+
+    const startMinutes = toMinutes(startTime);
+    const endMinutes = toMinutes(endTime);
+
+    if (endMinutes <= startMinutes) {
+      return res.status(400).send({
+        msg: "End time must be after the start time!",
+      });
+    }
+
+    const studio = await studioCollection.findOne({
+      _id: new ObjectId(studioId),
+    });
+
+    if (!studio) {
+      return res.status(404).send({
+        msg: "Studio not found!",
+      });
+    }
+
+    const hourlyRate = Number(studio.hourlyRate);
+
+    if (!Number.isFinite(hourlyRate) || hourlyRate <= 0) {
+      return res.status(400).send({
+        msg: "This studio has an invalid hourly rate!",
+      });
+    }
+
+    // Total price is calculated on the server from the studio's hourly rate.
+    const totalHours = (endMinutes - startMinutes) / 60;
+    const totalPrice = Math.round(hourlyRate * totalHours * 100) / 100;
+
+    const booking = {
+      studioId: new ObjectId(studioId),
+      studioTitle: studio.title,
+      userEmail: user.email,
+      userName: user.name,
+      bookingDate,
+      startTime,
+      endTime,
+      totalPrice,
+      status: "Pending",
+      createdAt: new Date(),
+    };
+
+    const result = await bookingCollection.insertOne(booking);
+
+    res.status(201).send({
+      success: true,
+      msg: "Booking created successfully!",
+      insertedId: result.insertedId,
+      booking: { ...booking, _id: result.insertedId },
+    });
+  } catch (error) {
+    console.error(error);
+    res.status(500).send({
+      msg: "Failed to create booking!",
+    });
+  }
+});
+
+// Get the logged in user's own bookings.
+app.get("/my-bookings/:email", requireAuth, async (req, res) => {
+  try {
+    const { email } = req.params;
+
+    // A user may only read their own bookings.
+    if (email.toLowerCase() !== req.user.email.toLowerCase()) {
+      return res.status(403).send({
+        msg: "You are not allowed to view these bookings!",
+      });
+    }
+
+    const result = await bookingCollection
+      .find({ userEmail: req.user.email })
+      .sort({ createdAt: -1 })
+      .toArray();
+
+    res.send(result);
+  } catch (error) {
+    console.error(error);
+    res.status(500).send({
+      msg: "Failed to fetch your bookings!",
+    });
+  }
+});
+
+// Cancel a booking (owner of the booking, only when still Pending).
+app.patch("/bookings/:id/cancel", requireAuth, async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    if (!ObjectId.isValid(id)) {
+      return res.status(400).send({
+        msg: "Invalid booking ID!",
+      });
+    }
+
+    const booking = await bookingCollection.findOne({
+      _id: new ObjectId(id),
+    });
+
+    if (!booking) {
+      return res.status(404).send({
+        msg: "Booking not found!",
+      });
+    }
+
+    // Only the user who made the booking may cancel it.
+    if (booking.userEmail.toLowerCase() !== req.user.email.toLowerCase()) {
+      return res.status(403).send({
+        msg: "You are not allowed to cancel this booking!",
+      });
+    }
+
+    if (booking.status !== "Pending") {
+      return res.status(409).send({
+        msg: "Only pending bookings can be cancelled!",
+      });
+    }
+
+    const result = await bookingCollection.updateOne(
+      { _id: new ObjectId(id), status: "Pending" },
+      { $set: { status: "Cancelled" } }
+    );
+
+    if (result.matchedCount === 0) {
+      return res.status(409).send({
+        msg: "Only pending bookings can be cancelled!",
+      });
+    }
+
+    res.send({
+      success: true,
+      msg: "Booking cancelled successfully!",
+    });
+  } catch (error) {
+    console.error(error);
+    res.status(500).send({
+      msg: "Failed to cancel booking!",
     });
   }
 });
