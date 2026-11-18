@@ -101,6 +101,163 @@ app.get("/studio/:id", async (req, res) => {
   }
 });
 
+
+
+app.post("/add-studio", async (req, res) => {
+  try {
+    const data = req.body;
+
+    if (
+      !data.title ||
+      !data.category ||
+      !data.hourlyRate ||
+      !data.location ||
+      !data.ownerEmail
+    ) {
+      return res.status(400).send({
+        msg: "Please provide all required studio information!",
+      });
+    }
+
+    const studioData = {
+      ...data,
+      hourlyRate: Number(data.hourlyRate),
+      securityDeposit: Number(data.securityDeposit || 0),
+      maxCapacity: Number(data.maxCapacity || 1),
+      rating: Number(data.rating || 0),
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    };
+
+    const result = await studioCollection.insertOne(studioData);
+
+    res.status(201).send({
+      success: true,
+      msg: "Studio added successfully!",
+      insertedId: result.insertedId,
+    });
+  } catch (error) {
+    console.error(error);
+    res.status(500).send({
+      msg: "Failed to add studio!",
+    });
+  }
+});
+
+app.get("/my-listings/:email", async (req, res) => {
+  try {
+    const { email } = req.params;
+
+    const result = await studioCollection
+      .find({ ownerEmail: email })
+      .sort({ createdAt: -1 })
+      .toArray();
+
+    res.send(result);
+  } catch (error) {
+    console.error(error);
+    res.status(500).send({
+      msg: "Failed to fetch your studio listings!",
+    });
+  }
+});
+
+app.patch("/studio/:id", async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { ownerEmail, _id, ...data } = req.body;
+
+    if (!ObjectId.isValid(id)) {
+      return res.status(400).send({
+        msg: "Invalid studio ID!",
+      });
+    }
+
+    if (!ownerEmail) {
+      return res.status(400).send({
+        msg: "Owner email is required!",
+      });
+    }
+
+    if (Object.keys(data).length === 0) {
+      return res.status(400).send({
+        msg: "No update information provided!",
+      });
+    }
+
+    const result = await studioCollection.updateOne(
+      {
+        _id: new ObjectId(id),
+        ownerEmail: ownerEmail,
+      },
+      {
+        $set: {
+          ...data,
+          updatedAt: new Date(),
+        },
+      }
+    );
+
+    if (result.matchedCount === 0) {
+      return res.status(404).send({
+        msg: "Studio not found or not owned by this user!",
+      });
+    }
+
+    res.send({
+      success: true,
+      msg: "Studio updated successfully!",
+      modifiedCount: result.modifiedCount,
+    });
+  } catch (error) {
+    console.error(error);
+    res.status(500).send({
+      msg: "Failed to update studio!",
+    });
+  }
+});
+
+app.delete("/studio/:id", async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { ownerEmail } = req.body;
+
+    if (!ObjectId.isValid(id)) {
+      return res.status(400).send({
+        msg: "Invalid studio ID!",
+      });
+    }
+
+    if (!ownerEmail) {
+      return res.status(400).send({
+        msg: "Owner email is required!",
+      });
+    }
+
+    const result = await studioCollection.deleteOne({
+      _id: new ObjectId(id),
+      ownerEmail: ownerEmail,
+    });
+
+    if (result.deletedCount === 0) {
+      return res.status(404).send({
+        msg: "Studio not found or not owned by this user!",
+      });
+    }
+
+    res.send({
+      success: true,
+      msg: "Studio deleted successfully!",
+    });
+  } catch (error) {
+    console.error(error);
+    res.status(500).send({
+      msg: "Failed to delete studio!",
+    });
+  }
+});
+
+
 // Home Route
 app.get("/", (req, res) => {
   res.send({
