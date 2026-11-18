@@ -1,26 +1,21 @@
-
 import express from "express";
 import cors from "cors";
 import "dotenv/config";
-import { MongoClient, ObjectId } from "mongodb";
+import { ObjectId } from "mongodb";
+import { toNodeHandler, fromNodeHeaders } from "better-auth/node";
+import { auth } from "./auth.js";
+import {
+  connectToMongoDB,
+  studioCollection,
+} from "./db.js";
+
+// Kept for backwards compatibility (the connection now lives in db.js).
+export { connectToMongoDB };
 
 const app = express();
 const PORT = process.env.PORT || 8000;
 
-const client = new MongoClient(process.env.MONGODB_URI);
-
-// MongoDB Connection
-export async function connectToMongoDB() {
-  try {
-    await client.connect();
-    console.log("Successfully connected to MongoDB!");
-    return client;
-  } catch (error) {
-    console.error("MongoDB connection failed:", error);
-    throw error;
-  }
-}
-
+// CORS: allow the frontend to call this API with cookies.
 app.use(
   cors({
     origin: process.env.CLIENT_URL,
@@ -28,16 +23,46 @@ app.use(
   })
 );
 
+// BetterAuth routes: /api/auth/sign-up, /api/auth/sign-in,
+// /api/auth/sign-out, /api/auth/get-session, /api/auth/token, ...
+// Mounted before express.json() so BetterAuth can read the request body.
+app.use("/api/auth", toNodeHandler(auth));
+
 app.use(express.json());
 
 // Database Connection
-const mongoClient = await connectToMongoDB();
+await connectToMongoDB();
 
-const db = mongoClient.db("studioSpace");
+// Returns the logged in user from the session cookie, or null.
+// The identity always comes from the verified session, never from
+// an email address sent in the request body.
+export async function getAuthenticatedUser(req) {
+  const session = await auth.api.getSession({
+    headers: fromNodeHeaders(req.headers),
+  });
+  return session?.user || null;
+}
 
-const userCollection = db.collection("users");
-const studioCollection = db.collection("studios");
-const bookingCollection = db.collection("bookings");
+// Protects private routes: 401 when there is no valid session.
+export async function requireAuth(req, res, next) {
+  try {
+    const user = await getAuthenticatedUser(req);
+
+    if (!user) {
+      return res.status(401).send({
+        msg: "Unauthorized! Please log in first.",
+      });
+    }
+
+    req.user = user;
+    next();
+  } catch (error) {
+    console.error(error);
+    res.status(500).send({
+      msg: "Authentication check failed!",
+    });
+  }
+}
 
 // 1. Get All Studios
 app.get("/studios", async (req, res) => {
@@ -256,7 +281,6 @@ app.delete("/studio/:id", async (req, res) => {
     });
   }
 });
-
 
 // Home Route
 app.get("/", (req, res) => {
