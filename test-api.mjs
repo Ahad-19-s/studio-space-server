@@ -67,11 +67,12 @@ async function api(path, { method = "GET", body, jar, headers = {} } = {}) {
   return { status: res.status, data, headers: res.headers, raw: text };
 }
 
+// Alice's session cookie jar, shared by the later stages.
+const jar = createJar();
+
 // ============================================================
 console.log("\n--- Stage 1: BetterAuth authentication ---");
 {
-  const jar = createJar();
-
   // CORS preflight with credentials
   const pre = await fetch(BASE + "/api/auth/get-session", {
     method: "OPTIONS",
@@ -162,6 +163,138 @@ console.log("\n--- Stage 1: BetterAuth authentication ---");
   // No cookie -> no session
   const anon = await api("/api/auth/get-session");
   check("no session without cookie", !anon.data?.user, `got ${anon.raw}`);
+}
+
+// ============================================================
+console.log("\n--- Stage 2: studio APIs secured with authentication ---");
+{
+  const aliceEmail = "alice@example.com";
+  const bobEmail = "bob@example.com";
+
+  // --- authentication is required ---
+  const unauthAdd = await api("/add-studio", {
+    method: "POST",
+    body: { title: "X", category: "Music", hourlyRate: 10, location: "Y" },
+  });
+  check("POST /add-studio without session -> 401", unauthAdd.status === 401, `got ${unauthAdd.status}`);
+
+  const unauthList = await api(`/my-listings/${aliceEmail}`);
+  check("GET /my-listings without session -> 401", unauthList.status === 401, `got ${unauthList.status}`);
+
+  const unauthPatch = await api("/studio/000000000000000000000000", { method: "PATCH", body: { title: "X" } });
+  check("PATCH /studio without session -> 401", unauthPatch.status === 401, `got ${unauthPatch.status}`);
+
+  const unauthDelete = await api("/studio/000000000000000000000000", { method: "DELETE" });
+  check("DELETE /studio without session -> 401", unauthDelete.status === 401, `got ${unauthDelete.status}`);
+
+  // --- second user (Bob) ---
+  const bobJar = createJar();
+  let bobAuth = await api("/api/auth/sign-up/email", {
+    method: "POST",
+    jar: bobJar,
+    body: { name: "Bob Renter", email: bobEmail, password: "Password1234" },
+  });
+  if (bobAuth.status !== 200) {
+    bobAuth = await api("/api/auth/sign-in/email", {
+      method: "POST",
+      jar: bobJar,
+      body: { email: bobEmail, password: "Password1234" },
+    });
+  }
+  check("second user (Bob) signed in", bobAuth.status === 200, `got ${bobAuth.status} ${bobAuth.raw}`);
+
+  // --- Alice creates a studio ---
+  const addRes = await api("/add-studio", {
+    method: "POST",
+    jar,
+    body: {
+      title: "Melody Practice Room",
+      category: "Music Studio",
+      hourlyRate: 25,
+      securityDeposit: 100,
+      maxCapacity: 8,
+      location: "Dhaka, Bangladesh",
+      image: "https://example.com/studio.png",
+      amenities: ["Wi-Fi", "Parking"],
+      overview: "A quiet practice room.",
+      ownerEmail: "attacker@example.com", // must be ignored
+      ownerName: "Hacker", // must be ignored
+      rating: 5, // must be ignored
+    },
+  });
+  check("POST /add-studio with session -> 201", addRes.status === 201, `got ${addRes.status} ${addRes.raw}`);
+  const studioId = addRes.data?.insertedId;
+  check("insertedId returned", Boolean(studioId));
+
+  const created = await api(`/studio/${studioId}`);
+  check("owner email comes from the session", created.data?.ownerEmail === aliceEmail, `got ${created.data?.ownerEmail}`);
+  check("owner name comes from the session", created.data?.ownerName === "Alice Owner", `got ${created.data?.ownerName}`);
+  check("client cannot set the rating", created.data?.rating === 0, `got ${created.data?.rating}`);
+
+  // --- my listings ---
+  const myList = await api(`/my-listings/${aliceEmail}`, { jar });
+  check("owner can read own listings", myList.status === 200 && Array.isArray(myList.data) && myList.data.some((s) => String(s._id) === String(studioId)), `got ${myList.status}`);
+
+  const otherList = await api(`/my-listings/${bobEmail}`, { jar });
+  check("reading another user's listings -> 403", otherList.status === 403, `got ${otherList.status}`);
+
+  // --- input validation ---
+  const badRate = await api("/add-studio", { method: "POST", jar, body: { title: "T", category: "C", hourlyRate: -5, location: "L" } });
+  check("negative hourly rate -> 400", badRate.status === 400, `got ${badRate.status}`);
+
+  const missingFields = await api("/add-studio", { method: "POST", jar, body: { title: "Only title" } });
+  check("missing required fields -> 400", missingFields.status === 400, `got ${missingFields.status}`);
+
+  const badIdPatch = await api("/studio/not-an-id", { method: "PATCH", jar, body: { title: "New" } });
+  check("PATCH invalid studio id -> 400", badIdPatch.status === 400, `got ${badIdPatch.status}`);
+
+  const notFoundPatch = await api("/studio/000000000000000000000000", { method: "PATCH", jar, body: { title: "New" } });
+  check("PATCH unknown studio -> 404", notFoundPatch.status === 404, `got ${notFoundPatch.status}`);
+
+  // --- Bob creates his own studio ---
+  const bobStudio = await api("/add-studio", {
+    method: "POST",
+    jar: bobJar,
+    body: { title: "Bob Photo Loft", category: "Photo Studio", hourlyRate: 40, location: "Chattogram" },
+  });
+  check("Bob can create his own studio", bobStudio.status === 201, `got ${bobStudio.status} ${bobStudio.raw}`);
+  const bobStudioId = bobStudio.data?.insertedId;
+
+  // --- ownership rules ---
+  const crossUpdate = await api(`/studio/${bobStudioId}`, { method: "PATCH", jar, body: { title: "Hacked" } });
+  check("updating someone else's studio -> 403", crossUpdate.status === 403, `got ${crossUpdate.status}`);
+
+  const crossDelete = await api(`/studio/${bobStudioId}`, { method: "DELETE", jar });
+  check("deleting someone else's studio -> 403", crossDelete.status === 403, `got ${crossDelete.status}`);
+
+  const ownerHijack = await api(`/studio/${studioId}`, { method: "PATCH", jar: bobJar, body: { ownerEmail: bobEmail } });
+  check("cannot hijack studio ownership -> 403", ownerHijack.status === 403, `got ${ownerHijack.status}`);
+
+  const stillBob = await api(`/studio/${bobStudioId}`);
+  check("Bob's studio is unchanged", stillBob.data?.title === "Bob Photo Loft", `got ${stillBob.data?.title}`);
+
+  // --- owner updates own studio ---
+  const ownUpdate = await api(`/studio/${studioId}`, { method: "PATCH", jar, body: { title: "Melody Room (Renovated)", hourlyRate: 30 } });
+  check("owner can update own studio", ownUpdate.status === 200, `got ${ownUpdate.status} ${ownUpdate.raw}`);
+
+  const afterUpdate = await api(`/studio/${studioId}`);
+  check("update was applied", afterUpdate.data?.title === "Melody Room (Renovated)" && afterUpdate.data?.hourlyRate === 30, `got ${JSON.stringify({ title: afterUpdate.data?.title, hourlyRate: afterUpdate.data?.hourlyRate })}`);
+
+  const badUpdate = await api(`/studio/${studioId}`, { method: "PATCH", jar, body: { hourlyRate: "abc" } });
+  check("invalid hourly rate update -> 400", badUpdate.status === 400, `got ${badUpdate.status}`);
+
+  const emptyUpdate = await api(`/studio/${studioId}`, { method: "PATCH", jar, body: {} });
+  check("empty update -> 400", emptyUpdate.status === 400, `got ${emptyUpdate.status}`);
+
+  // --- delete ---
+  const ownDelete = await api(`/studio/${studioId}`, { method: "DELETE", jar });
+  check("owner can delete own studio", ownDelete.status === 200, `got ${ownDelete.status} ${ownDelete.raw}`);
+
+  const gone = await api(`/studio/${studioId}`);
+  check("deleted studio -> 404", gone.status === 404, `got ${gone.status}`);
+
+  const bobDelete = await api(`/studio/${bobStudioId}`, { method: "DELETE", jar: bobJar });
+  check("Bob deletes his own studio", bobDelete.status === 200, `got ${bobDelete.status}`);
 }
 
 // ---- results ----

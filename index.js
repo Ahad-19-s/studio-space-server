@@ -128,28 +128,54 @@ app.get("/studio/:id", async (req, res) => {
 
 
 
-app.post("/add-studio", async (req, res) => {
+// Add a new studio (authenticated users only).
+// The owner always comes from the verified session, never from the body.
+app.post("/add-studio", requireAuth, async (req, res) => {
   try {
-    const data = req.body;
+    const data = req.body || {};
+    const user = req.user;
 
-    if (
-      !data.title ||
-      !data.category ||
-      !data.hourlyRate ||
-      !data.location ||
-      !data.ownerEmail
-    ) {
+    if (!data.title || !data.category || !data.hourlyRate || !data.location) {
       return res.status(400).send({
         msg: "Please provide all required studio information!",
       });
     }
 
+    const hourlyRate = Number(data.hourlyRate);
+    const securityDeposit = Number(data.securityDeposit ?? 0);
+    const maxCapacity = Number(data.maxCapacity ?? 1);
+
+    if (!Number.isFinite(hourlyRate) || hourlyRate <= 0) {
+      return res.status(400).send({
+        msg: "Hourly rate must be a positive number!",
+      });
+    }
+
+    if (!Number.isFinite(securityDeposit) || securityDeposit < 0) {
+      return res.status(400).send({
+        msg: "Security deposit must be 0 or more!",
+      });
+    }
+
+    if (!Number.isInteger(maxCapacity) || maxCapacity < 1) {
+      return res.status(400).send({
+        msg: "Max capacity must be a whole number of at least 1!",
+      });
+    }
+
     const studioData = {
-      ...data,
-      hourlyRate: Number(data.hourlyRate),
-      securityDeposit: Number(data.securityDeposit || 0),
-      maxCapacity: Number(data.maxCapacity || 1),
-      rating: Number(data.rating || 0),
+      title: String(data.title),
+      category: String(data.category),
+      hourlyRate,
+      securityDeposit,
+      maxCapacity,
+      location: String(data.location),
+      image: data.image ? String(data.image) : "",
+      amenities: Array.isArray(data.amenities) ? data.amenities.map(String) : [],
+      overview: data.overview ? String(data.overview) : "",
+      ownerName: user.name,
+      ownerEmail: user.email,
+      rating: 0,
       createdAt: new Date(),
       updatedAt: new Date(),
     };
@@ -169,12 +195,20 @@ app.post("/add-studio", async (req, res) => {
   }
 });
 
-app.get("/my-listings/:email", async (req, res) => {
+// Get the logged in user's own listings.
+app.get("/my-listings/:email", requireAuth, async (req, res) => {
   try {
     const { email } = req.params;
 
+    // A user may only read their own listings.
+    if (email.toLowerCase() !== req.user.email.toLowerCase()) {
+      return res.status(403).send({
+        msg: "You are not allowed to view these listings!",
+      });
+    }
+
     const result = await studioCollection
-      .find({ ownerEmail: email })
+      .find({ ownerEmail: req.user.email })
       .sort({ createdAt: -1 })
       .toArray();
 
@@ -187,10 +221,10 @@ app.get("/my-listings/:email", async (req, res) => {
   }
 });
 
-app.patch("/studio/:id", async (req, res) => {
+// Update a studio (owner only).
+app.patch("/studio/:id", requireAuth, async (req, res) => {
   try {
     const { id } = req.params;
-    const { ownerEmail, _id, ...data } = req.body;
 
     if (!ObjectId.isValid(id)) {
       return res.status(400).send({
@@ -198,36 +232,80 @@ app.patch("/studio/:id", async (req, res) => {
       });
     }
 
-    if (!ownerEmail) {
-      return res.status(400).send({
-        msg: "Owner email is required!",
+    const studio = await studioCollection.findOne({ _id: new ObjectId(id) });
+
+    if (!studio) {
+      return res.status(404).send({
+        msg: "Studio not found!",
       });
     }
 
-    if (Object.keys(data).length === 0) {
+    // Only the owner may update the studio.
+    if (studio.ownerEmail.toLowerCase() !== req.user.email.toLowerCase()) {
+      return res.status(403).send({
+        msg: "You are not allowed to update this studio!",
+      });
+    }
+
+    const data = req.body || {};
+
+    // Only these fields can be changed by a client.
+    const allowedFields = [
+      "title",
+      "category",
+      "hourlyRate",
+      "securityDeposit",
+      "maxCapacity",
+      "location",
+      "image",
+      "amenities",
+      "overview",
+    ];
+
+    const updates = {};
+    for (const field of allowedFields) {
+      if (data[field] !== undefined) {
+        updates[field] = data[field];
+      }
+    }
+
+    if (Object.keys(updates).length === 0) {
       return res.status(400).send({
         msg: "No update information provided!",
       });
     }
 
-    const result = await studioCollection.updateOne(
-      {
-        _id: new ObjectId(id),
-        ownerEmail: ownerEmail,
-      },
-      {
-        $set: {
-          ...data,
-          updatedAt: new Date(),
-        },
+    // Validate numeric values when they are being updated.
+    if (updates.hourlyRate !== undefined) {
+      const hourlyRate = Number(updates.hourlyRate);
+      if (!Number.isFinite(hourlyRate) || hourlyRate <= 0) {
+        return res.status(400).send({ msg: "Hourly rate must be a positive number!" });
       }
-    );
-
-    if (result.matchedCount === 0) {
-      return res.status(404).send({
-        msg: "Studio not found or not owned by this user!",
-      });
+      updates.hourlyRate = hourlyRate;
     }
+
+    if (updates.securityDeposit !== undefined) {
+      const securityDeposit = Number(updates.securityDeposit);
+      if (!Number.isFinite(securityDeposit) || securityDeposit < 0) {
+        return res.status(400).send({ msg: "Security deposit must be 0 or more!" });
+      }
+      updates.securityDeposit = securityDeposit;
+    }
+
+    if (updates.maxCapacity !== undefined) {
+      const maxCapacity = Number(updates.maxCapacity);
+      if (!Number.isInteger(maxCapacity) || maxCapacity < 1) {
+        return res.status(400).send({ msg: "Max capacity must be a whole number of at least 1!" });
+      }
+      updates.maxCapacity = maxCapacity;
+    }
+
+    updates.updatedAt = new Date();
+
+    const result = await studioCollection.updateOne(
+      { _id: new ObjectId(id) },
+      { $set: updates }
+    );
 
     res.send({
       success: true,
@@ -242,10 +320,10 @@ app.patch("/studio/:id", async (req, res) => {
   }
 });
 
-app.delete("/studio/:id", async (req, res) => {
+// Delete a studio (owner only).
+app.delete("/studio/:id", requireAuth, async (req, res) => {
   try {
     const { id } = req.params;
-    const { ownerEmail } = req.body;
 
     if (!ObjectId.isValid(id)) {
       return res.status(400).send({
@@ -253,26 +331,29 @@ app.delete("/studio/:id", async (req, res) => {
       });
     }
 
-    if (!ownerEmail) {
-      return res.status(400).send({
-        msg: "Owner email is required!",
+    const studio = await studioCollection.findOne({ _id: new ObjectId(id) });
+
+    if (!studio) {
+      return res.status(404).send({
+        msg: "Studio not found!",
+      });
+    }
+
+    // Only the owner may delete the studio.
+    if (studio.ownerEmail.toLowerCase() !== req.user.email.toLowerCase()) {
+      return res.status(403).send({
+        msg: "You are not allowed to delete this studio!",
       });
     }
 
     const result = await studioCollection.deleteOne({
       _id: new ObjectId(id),
-      ownerEmail: ownerEmail,
     });
-
-    if (result.deletedCount === 0) {
-      return res.status(404).send({
-        msg: "Studio not found or not owned by this user!",
-      });
-    }
 
     res.send({
       success: true,
       msg: "Studio deleted successfully!",
+      deletedCount: result.deletedCount,
     });
   } catch (error) {
     console.error(error);
