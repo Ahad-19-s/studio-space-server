@@ -1,0 +1,24 @@
+# Render Blueprint — StudioSpace Express API
+# Dashboard → New → Blueprint → connect Ahad-19-s/studio-space-server.
+# Secret env vars are set in the dashboard (sync: false), never in git.
+services:
+  - type: web
+    name: studiospace-server
+    runtime: node
+    plan: free
+    buildCommand: npm install
+    startCommand: npm start
+    healthCheckPath: /
+    envVars:
+      - key: MONGODB_URI
+        sync: false
+      - key: MONGO_DB_URI
+        sync: false
+      - key: CLIENT_URL
+        sync: false
+      - key: BETTER_AUTH_URL
+        sync: false
+      - key: BETTER_AUTH_SECRET
+        sync: false
+      - key: JWT_SECRET
+        sync: false

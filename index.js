@@ -5,7 +5,7 @@ import { MongoClient, ObjectId } from 'mongodb';
 import { createRemoteJWKSet, jwtVerify } from 'jose';
 
 const app = express();
-const PORT = 5000;
+const PORT = process.env.PORT || 5000;
 app.use(express.json())
 app.use(cors())
 
