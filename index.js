@@ -6,8 +6,10 @@ import { toNodeHandler, fromNodeHeaders } from "better-auth/node";
 import { auth } from "./auth.js";
 import {
   connectToMongoDB,
+  client,
   studioCollection,
   bookingCollection,
+  bookingLockCollection,
 } from "./db.js";
 
 // Kept for backwards compatibility (the connection now lives in db.js).
@@ -33,6 +35,67 @@ app.use(express.json());
 
 // Database Connection
 await connectToMongoDB();
+
+// Useful indexes for the most common queries.
+async function createIndexes() {
+  await studioCollection.createIndex({ ownerEmail: 1 });
+  await studioCollection.createIndex({ rating: -1, createdAt: -1 });
+  await bookingCollection.createIndex({ userEmail: 1, bookingDate: -1 });
+  await bookingCollection.createIndex({ studioId: 1, bookingDate: 1 });
+}
+
+try {
+  await createIndexes();
+} catch (error) {
+  console.error("Failed to create indexes:", error.message);
+}
+
+// Transactions only exist on replica sets / mongos, so we check once
+// whether this MongoDB deployment supports them. The booking lock
+// below works either way.
+let transactionsSupported = false;
+
+async function detectTransactionSupport() {
+  const session = client.startSession();
+  try {
+    session.startTransaction();
+    await bookingCollection.findOne({}, { session });
+    await session.commitTransaction();
+    transactionsSupported = true;
+  } catch {
+    try {
+      await session.abortTransaction();
+    } catch {
+      // nothing to abort
+    }
+    transactionsSupported = false;
+  } finally {
+    await session.endSession();
+  }
+}
+
+await detectTransactionSupport();
+console.log("MongoDB transactions supported:", transactionsSupported);
+
+// Runs a function inside a transaction when the deployment supports
+// it, otherwise runs it normally. The booking lock still guarantees
+// that only one booking attempt runs at a time per studio + date.
+async function runAtomically(work) {
+  if (!transactionsSupported) {
+    return work({});
+  }
+
+  const session = client.startSession();
+  try {
+    let result;
+    await session.withTransaction(async () => {
+      result = await work({ session });
+    });
+    return result;
+  } finally {
+    await session.endSession();
+  }
+}
 
 // Returns the logged in user from the session cookie, or null.
 // The identity always comes from the verified session, never from
@@ -374,6 +437,54 @@ function toMinutes(time) {
   return hours * 60 + minutes;
 }
 
+// ---- Booking lock (double booking prevention) ----
+// A plain overlap check alone does not prevent race conditions: two
+// requests could both check at the same time, both see "free" and both
+// insert. This lock makes sure only one booking attempt per studio +
+// date runs the check and the insert at a time.
+//
+// Lock documents live in the bookingLocks collection. The _id of a
+// document is unique, so insertOne either succeeds (we own the lock)
+// or fails with a duplicate key error (somebody else owns it).
+const LOCK_TTL_MS = 20000; // a stuck lock expires automatically after 20s
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function acquireBookingLock(key) {
+  const token = `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+
+  for (let attempt = 0; attempt < 100; attempt++) {
+    try {
+      await bookingLockCollection.insertOne({
+        _id: key,
+        token,
+        expiresAt: new Date(Date.now() + LOCK_TTL_MS),
+      });
+      return token;
+    } catch (error) {
+      // 11000 = duplicate key error -> the lock already exists.
+      if (error.code !== 11000) throw error;
+
+      // Remove the lock only if it has already expired, then retry.
+      await bookingLockCollection.deleteOne({
+        _id: key,
+        expiresAt: { $lt: new Date() },
+      });
+
+      await sleep(50);
+    }
+  }
+
+  throw new Error("Could not acquire the booking lock.");
+}
+
+async function releaseBookingLock(key, token) {
+  // Only the owner of the lock removes it.
+  await bookingLockCollection.deleteOne({ _id: key, token });
+}
+
 // Create a new booking (authenticated users only).
 // Identity and price always come from the server, never from the client.
 app.post("/bookings", requireAuth, async (req, res) => {
@@ -396,6 +507,16 @@ app.post("/bookings", requireAuth, async (req, res) => {
     if (!DATE_PATTERN.test(bookingDate) || Number.isNaN(Date.parse(bookingDate))) {
       return res.status(400).send({
         msg: "Booking date must be a valid date in YYYY-MM-DD format!",
+      });
+    }
+
+    // The booking date cannot be in the past.
+    const now = new Date();
+    const today = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}-${String(now.getDate()).padStart(2, "0")}`;
+
+    if (bookingDate < today) {
+      return res.status(400).send({
+        msg: "Booking date cannot be in the past!",
       });
     }
 
@@ -449,14 +570,62 @@ app.post("/bookings", requireAuth, async (req, res) => {
       createdAt: new Date(),
     };
 
-    const result = await bookingCollection.insertOne(booking);
+    // ---- Double booking prevention ----
+    // 1. Take the lock for this studio + date so no other request can
+    //    run the overlap check at the same time.
+    // 2. Look for an existing booking that overlaps the requested slot.
+    // 3. Insert the booking (inside a transaction when available).
+    const lockKey = `${studioId}_${bookingDate}`;
+    const lockToken = await acquireBookingLock(lockKey);
 
-    res.status(201).send({
-      success: true,
-      msg: "Booking created successfully!",
-      insertedId: result.insertedId,
-      booking: { ...booking, _id: result.insertedId },
-    });
+    try {
+      const outcome = await runAtomically(async (sessionOptions) => {
+        const existingBookings = await bookingCollection
+          .find(
+            {
+              studioId: new ObjectId(studioId),
+              bookingDate,
+              // Cancelled bookings do not hold the time slot.
+              status: { $in: ["Pending", "Confirmed"] },
+            },
+            sessionOptions
+          )
+          .toArray();
+
+        // Overlap condition:
+        // newStart < existingEnd && newEnd > existingStart
+        const hasConflict = existingBookings.some(
+          (existing) =>
+            startMinutes < toMinutes(existing.endTime) &&
+            endMinutes > toMinutes(existing.startTime)
+        );
+
+        if (hasConflict) {
+          return { conflict: true };
+        }
+
+        const insertResult = await bookingCollection.insertOne(
+          booking,
+          sessionOptions
+        );
+        return { conflict: false, insertedId: insertResult.insertedId };
+      });
+
+      if (outcome.conflict) {
+        return res.status(409).send({
+          msg: "This time slot is already booked for the selected date!",
+        });
+      }
+
+      res.status(201).send({
+        success: true,
+        msg: "Booking created successfully!",
+        insertedId: outcome.insertedId,
+        booking: { ...booking, _id: outcome.insertedId },
+      });
+    } finally {
+      await releaseBookingLock(lockKey, lockToken);
+    }
   } catch (error) {
     console.error(error);
     res.status(500).send({

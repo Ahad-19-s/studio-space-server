@@ -1,6 +1,7 @@
 // StudioSpace Backend - automated API tests
 // Run with:  node test-api.mjs   (server must already be running)
 import "dotenv/config";
+import { MongoClient, ObjectId } from "mongodb";
 
 const BASE = `http://localhost:${process.env.PORT || 8000}`;
 const ORIGIN = process.env.BETTER_AUTH_URL || BASE;
@@ -407,6 +408,92 @@ console.log("\n--- Stage 3: booking APIs ---");
 
   // cleanup: Bob cancels his booking so no stray bookings remain
   await api(`/bookings/${bobBookingId}/cancel`, { method: "PATCH", jar: bobJar });
+}
+
+// ============================================================
+console.log("\n--- Stage 4: booking validation & double booking prevention ---");
+{
+  const date = "2027-04-01";
+  const book = (body) => api("/bookings", { method: "POST", jar, body: { studioId: bookingStudioId, ...body } });
+
+  // --- validation ---
+  const past = await book({ bookingDate: "2020-01-01", startTime: "10:00", endTime: "12:00" });
+  check("past booking date -> 400", past.status === 400, `got ${past.status}`);
+
+  // --- first booking on the slot ---
+  const a = await book({ bookingDate: date, startTime: "10:00", endTime: "12:00" });
+  check("booking A (10:00-12:00) created", a.status === 201, `got ${a.status} ${a.raw}`);
+  const bookingA = a.data?.insertedId;
+
+  // --- overlapping bookings are rejected with 409 ---
+  const overlap1 = await book({ bookingDate: date, startTime: "11:00", endTime: "13:00" });
+  check("partially overlapping booking -> 409", overlap1.status === 409, `got ${overlap1.status}`);
+
+  const overlap2 = await book({ bookingDate: date, startTime: "10:30", endTime: "11:00" });
+  check("fully contained booking -> 409", overlap2.status === 409, `got ${overlap2.status}`);
+
+  const overlap3 = await book({ bookingDate: date, startTime: "10:00", endTime: "11:00" });
+  check("same start time -> 409", overlap3.status === 409, `got ${overlap3.status}`);
+
+  // --- non-overlapping bookings are accepted ---
+  const adjacentEnd = await book({ bookingDate: date, startTime: "12:00", endTime: "14:00" });
+  check("booking touching the end (12:00-14:00) -> 201", adjacentEnd.status === 201, `got ${adjacentEnd.status}`);
+
+  const adjacentStart = await book({ bookingDate: date, startTime: "08:00", endTime: "10:00" });
+  check("booking touching the start (08:00-10:00) -> 201", adjacentStart.status === 201, `got ${adjacentStart.status}`);
+
+  const otherDay = await book({ bookingDate: "2027-04-02", startTime: "10:00", endTime: "12:00" });
+  check("same time on another date -> 201", otherDay.status === 201, `got ${otherDay.status}`);
+
+  // --- concurrency: two identical requests at the same time ---
+  const [c1, c2] = await Promise.all([
+    book({ bookingDate: "2027-04-03", startTime: "10:00", endTime: "12:00" }),
+    book({ bookingDate: "2027-04-03", startTime: "10:00", endTime: "12:00" }),
+  ]);
+  const concurrentStatuses = [c1.status, c2.status].sort().join(",");
+  check("concurrent identical bookings: only one succeeds", concurrentStatuses === "201,409", `got ${c1.status}, ${c2.status}`);
+
+  // --- a Confirmed booking stored in the database also blocks the slot ---
+  const mongoClient = new MongoClient(process.env.MONGODB_URI);
+  await mongoClient.connect();
+  const bookings = mongoClient.db("studioSpace").collection("bookings");
+  const studios = mongoClient.db("studioSpace").collection("studios");
+  const confirmedDate = "2027-04-05";
+  await bookings.insertOne({
+    studioId: new ObjectId(bookingStudioId),
+    studioTitle: "Sunset Recording Booth",
+    userEmail: "manager@example.com",
+    userName: "Studio Manager",
+    bookingDate: confirmedDate,
+    startTime: "09:00",
+    endTime: "11:00",
+    totalPrice: 40,
+    status: "Confirmed",
+    createdAt: new Date(),
+  });
+
+  const blocked = await book({ bookingDate: confirmedDate, startTime: "10:00", endTime: "12:00" });
+  check("Confirmed booking blocks the slot -> 409", blocked.status === 409, `got ${blocked.status}`);
+
+  const freePart = await book({ bookingDate: confirmedDate, startTime: "11:00", endTime: "13:00" });
+  check("free part of the same day -> 201", freePart.status === 201, `got ${freePart.status}`);
+
+  // --- a cancelled booking frees its slot ---
+  const cancelA = await api(`/bookings/${bookingA}/cancel`, { method: "PATCH", jar });
+  check("cancel booking A", cancelA.status === 200, `got ${cancelA.status} ${cancelA.raw}`);
+
+  const rebook = await book({ bookingDate: date, startTime: "10:00", endTime: "12:00" });
+  check("cancelled booking frees the slot -> 201", rebook.status === 201, `got ${rebook.status}`);
+
+  // --- cleanup: remove everything these tests created ---
+  const removedBookings = await bookings.deleteMany({ studioId: new ObjectId(bookingStudioId) });
+  const removedStudio = await studios.deleteOne({ _id: new ObjectId(bookingStudioId) });
+  check(
+    "cleanup removed test bookings and studio",
+    removedBookings.deletedCount > 0 && removedStudio.deletedCount === 1,
+    `bookings: ${removedBookings.deletedCount}, studio: ${removedStudio.deletedCount}`
+  );
+  await mongoClient.close();
 }
 
 // ---- results ----
