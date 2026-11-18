@@ -24,6 +24,8 @@ const db = connectClient.db("studioSpace")
 const categoryData = db.collection("category")
 const studiosData = db.collection("cart")
 const bookingData = db.collection("booking")
+// Saved-studios wishlist: one doc per { email, studioId } pair.
+const wishlistData = db.collection("wishlist")
 
 /// verifyToken
 const verifyToken = async (req, res, next) => {
@@ -114,7 +116,8 @@ app.post("/booking", verifyToken, async (req, res) => {
     const existingBooking = await bookingData.findOne({
         studioId: data.studioId,
         bookingDate: data.bookingDate,
-        status: "Confirmed",
+        // Both Pending and Confirmed bookings hold their time slot.
+        status: { $in: ["Pending", "Confirmed"] },
         startTime: { $lt: data.endTime },
         endTime: { $gt: data.startTime }
     });
@@ -154,11 +157,39 @@ app.patch("/bookings/cancel/:id", async (req, res) => {
 });
 
 // delete my listing data 
+// With ?id=<studioId> only that studio is removed; without it the
+// legacy behaviour (first studio of the owner) is kept.
 app.delete("/my-listing/:email", verifyToken, async (req, res) => {
     const { email } = req.params
-    const result = await studiosData.deleteOne({ email: email })
+    const { id } = req.query
+    const result = id
+        ? await studiosData.deleteOne({ _id: new ObjectId(id) })
+        : await studiosData.deleteOne({ email: email })
     res.send(result)
 
+})
+
+// ---- Saved-studios wishlist ----
+// List the studios a user has saved.
+app.get("/wishlist/:email", async (req, res) => {
+    const { email } = req.params
+    const result = await wishlistData.find({ email: email }).toArray()
+    res.send(result)
+})
+
+// Add/remove a studio from the wishlist (returns the new saved state).
+app.post("/wishlist/toggle", verifyToken, async (req, res) => {
+    const { email, studioId } = req.body || {}
+    if (!email || !studioId) {
+        return res.status(400).send({ message: "Email and studioId are required!" })
+    }
+    const existing = await wishlistData.findOne({ email: email, studioId: studioId })
+    if (existing) {
+        await wishlistData.deleteOne({ _id: existing._id })
+        return res.send({ saved: false })
+    }
+    await wishlistData.insertOne({ email: email, studioId: studioId, createdAt: new Date() })
+    res.send({ saved: true })
 })
 //updatedData 
 app.patch("/my-listing-update/:id", async (req, res) => {
