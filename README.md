@@ -1,80 +1,83 @@
 # StudioSpace Backend
 
-Backend server for **B14-A8-Cat_Harry – StudioSpace**, a studio booking
-platform. It exposes a REST API for studios and bookings and handles
-authentication with BetterAuth.
+REST API for **B14-A8-Cat_Harry – StudioSpace**, a peer-to-peer creative
+workspace and studio booking marketplace. Serves studio listings, bookings and
+the wishlist, and authenticates every mutation from BetterAuth's **HTTPOnly
+session cookie**.
 
 ## Technologies
 
-- Node.js (ES Modules)
-- Express.js
+- Node.js (ES Modules) + Express 5
 - MongoDB Native Driver (no Mongoose)
-- BetterAuth + BetterAuth MongoDB Adapter (registration, login, sessions, JWT)
-- dotenv
-- cors (with credentials)
-- HTTPOnly session cookies
+- BetterAuth + BetterAuth MongoDB Adapter + JWT — sessions and users live in
+  the same `studioSpace` database the client writes to
+- `jose` for Bearer-JWT verification against the client's JWKS (fallback path)
+- `cors` with `credentials: true`, `dotenv`
 
 ## Project structure
 
 ```
 studiospace-server/
-├── index.js        # Express server, API routes, auth middleware, error handling
-├── auth.js         # BetterAuth configuration (MongoDB adapter + JWT plugin)
-├── db.js           # Shared MongoDB client, database and collections
-├── test-api.mjs    # Automated API test suite
-├── .env.example    # Environment variable template (placeholders only)
+├── index.js         # Express app: routes, validation, error handling
+├── auth.js          # BetterAuth instance + requireAuth middleware + isOwner
+├── db.js            # Shared MongoDB client/connection
+├── test-api.mjs     # 61-assertion test suite (npm test)
+├── .env.example     # Template with placeholders only
+├── render.yaml      # Render deploy blueprint
 └── package.json
 ```
 
-Database: **`studioSpace`** with the collections `users`, `studios`,
-`bookings` (plus BetterAuth's internal `session`, `account`, `verification`,
-`jwks` collections and the internal `bookingLocks` collection).
+Database: **`studioSpace`**
+
+| Collection | Contents |
+| --- | --- |
+| `cart` | Studio listings (legacy name kept — the seed data lives here) |
+| `booking` | Reservations with a `status` of `Pending`/`Confirmed`/`Completed`/`Cancelled` |
+| `wishlist` | One document per `{ email, studioId }` pair |
+| `category` | Studio categories (the client currently uses a static list) |
+| `users`, `session`, `account`, `verification`, `jwks` | BetterAuth internals |
 
 ## Installation
 
 ```bash
 npm install
+cp .env.example .env   # then fill in real values
 ```
 
 ## Environment variables
 
-Copy the template and fill in your own values (never commit `.env`):
+| Variable | Required | Description |
+| --- | --- | --- |
+| `MONGO_DB_URI` | yes | MongoDB connection string (`MONGODB_URI` also accepted) |
+| `BETTER_AUTH_SECRET` | yes | **Must match the client's value exactly** — the session cookie is signed with it, and a mismatch makes every cookie-authenticated request return 401 |
+| `CLIENT_URL` | yes | Frontend origin(s), comma separated. Drives CORS and `trustedOrigins` |
+| `BETTER_AUTH_URL` | no | BetterAuth `baseURL`; falls back to `CLIENT_URL` |
+| `PORT` | no | Defaults to `8000`. Render injects this at runtime |
+
+Never commit `.env`; `.env.example` contains placeholders only.
+
+## Run
 
 ```bash
-cp .env.example .env
+npm start          # http://localhost:8000
 ```
 
-| Variable | Description |
-| --- | --- |
-| `PORT` | Server port (default `8000`) |
-| `MONGODB_URI` | MongoDB connection string |
-| `CLIENT_URL` | Frontend origin allowed to call the API with credentials |
-| `BETTER_AUTH_SECRET` | Secret used by BetterAuth to sign cookies and encrypt JWT keys |
-| `BETTER_AUTH_URL` | Public URL of this backend (use `https://` in production) |
-| `JWT_SECRET` | Fallback secret if `BETTER_AUTH_SECRET` is not set |
-| `COOKIE_SAMESITE` | Optional. `none` when frontend and backend are on different domains (requires https) |
+The process connects to MongoDB before listening, so the health check only
+passes once the database is reachable.
 
-## Run the server
+## Test
+
+Both servers must be running (the suite obtains a real session cookie from the
+client):
 
 ```bash
-node index.js
-# or
-npm start
+npm start                                  # terminal 1 — API on :8000
+cd ../studiospace-client && npm start      # terminal 2 — Next.js on :3000
+npm test                                   # terminal 1
 ```
 
-The server starts on `http://localhost:8000`, connects to MongoDB and
-creates the required indexes.
-
-## Run the tests
-
-Start the server first, then in a second terminal:
-
-```bash
-node test-api.mjs
-```
-
-The suite covers authentication, studio CRUD security, bookings, validation
-and double booking prevention.
+`npm test` exits `0` on success. Every probe document is deleted from MongoDB
+afterwards, so the seed accounts stay pristine.
 
 ## API endpoints
 
@@ -82,108 +85,102 @@ and double booking prevention.
 
 | Method | Endpoint | Description |
 | --- | --- | --- |
-| GET | `/` | Server status |
-| GET | `/studios` | All studios |
-| GET | `/featured-studios` | Six highest rated / newest studios |
-| GET | `/studio/:id` | Studio details by id |
+| GET | `/` | Health check (Render `healthCheckPath`) |
+| GET | `/explore-studios` | All studios. Supports `?category=`, `?sort=rating`, `?limit=6` |
+| GET | `/explore-studios/:id` | One studio |
+| GET | `/cetagory`, `/category` | Category list |
 
-### Authentication (BetterAuth, mounted at `/api/auth`)
+### Protected — requires the HTTPOnly session cookie (otherwise **401**)
+
+| Method | Endpoint | Notes |
+| --- | --- | --- |
+| POST | `/add-studio` | Creates a listing; owner comes from the session |
+| GET | `/add-studio` | Auth probe, kept for older clients |
+| GET | `/my-listing/:email` | **403** unless `:email` is the session user |
+| GET | `/my-listing-edit/:id` | **403** unless you own the listing |
+| PATCH | `/my-listing-update/:id` | **403** for other owners |
+| DELETE | `/my-listing/:email?id=<id>` | **403** for other owners; `id` is required |
+| POST | `/booking` | Creates a `Pending` booking |
+| GET | `/booking/:email` | **403** unless `:email` is the session user |
+| PATCH | `/bookings/cancel/:id` | Own **Pending** booking only, else **403**/**409** |
+| GET | `/wishlist/:email` | **403** unless `:email` is the session user |
+| POST | `/wishlist/toggle` | `{ studioId }` — returns `{ saved: boolean }` |
+
+### Authentication (served by the client at `CLIENT_URL/api/auth`)
+
+BetterAuth runs inside the Next.js app, not here:
 
 | Method | Endpoint | Description |
 | --- | --- | --- |
-| POST | `/api/auth/sign-up/email` | Register (`name`, `email`, `password`, optional `photoURL`) |
-| POST | `/api/auth/sign-in/email` | Login (`email`, `password`) |
-| POST | `/api/auth/sign-out` | Logout |
-| GET | `/api/auth/get-session` | Current session/user (persists across reloads) |
-| GET | `/api/auth/token` | Signed JWT for the logged in user |
+| POST | `/api/auth/sign-up/email` | Register |
+| POST | `/api/auth/sign-in/email` | Login — sets the HTTPOnly session cookie |
+| GET | `/api/auth/get-session` | Current session |
+| GET | `/api/auth/token` | Signed JWT (Bearer fallback) |
+| GET | `/api/auth/jwks` | Public keys this server verifies Bearer tokens against |
 
-### Studios (protected)
-
-| Method | Endpoint | Description |
-| --- | --- | --- |
-| POST | `/add-studio` | Add a studio (owner comes from the session) |
-| GET | `/my-listings/:email` | Own listings only (403 for other emails) |
-| PATCH | `/studio/:id` | Update own studio (403 for other owners) |
-| DELETE | `/studio/:id` | Delete own studio (403 for other owners) |
-
-Studio body fields: `title`, `category`, `hourlyRate`, `securityDeposit`,
-`maxCapacity`, `location`, `image`, `amenities`, `overview`. Ownership
-fields (`ownerName`, `ownerEmail`, `rating`, timestamps) are always set by
-the server.
-
-### Bookings (protected)
-
-| Method | Endpoint | Description |
-| --- | --- | --- |
-| POST | `/bookings` | Create a booking (`studioId`, `bookingDate`, `startTime`, `endTime`) |
-| GET | `/my-bookings/:email` | Own bookings only (403 for other emails) |
-| PATCH | `/bookings/:id/cancel` | Cancel own `Pending` booking |
-
-Booking rules:
-
-- New bookings get status `Pending`; cancelling sets it to `Cancelled`.
-- `userEmail`, `userName` and `totalPrice` are always computed on the
-  server – values sent by the client are ignored.
-- `totalPrice = hourlyRate × (endTime − startTime)` in hours.
-- Only `Pending` bookings can be cancelled (otherwise HTTP 409).
-
-### Status codes
+## Status codes
 
 | Code | Meaning |
 | --- | --- |
-| 400 | Invalid input (bad id, date, time, missing fields, invalid JSON) |
-| 401 | Not authenticated (no valid session cookie) |
-| 403 | Authenticated but not allowed (someone else's data) |
+| 200 / 201 | Success / resource created |
+| 400 | Invalid input — bad id, date, time, missing field, malformed JSON |
+| 401 | Not authenticated — no valid session cookie |
+| 403 | Authenticated but not allowed — someone else's data, or disallowed origin |
 | 404 | Record or route not found |
-| 409 | Booking time conflict / booking state conflict |
-| 500 | Unexpected server error (generic message, no stack traces) |
+| 409 | Booking time conflict, or invalid booking state transition |
+| 500 | Unexpected error — generic JSON message, never a stack trace |
 
-## Authentication and cookies
+## Authentication (Challenge 1)
 
-- BetterAuth with the **MongoDB Adapter** stores users in the `users`
-  collection (passwords are hashed by BetterAuth and never returned).
-- Sessions are stored in **HTTPOnly** cookies, so JavaScript cannot read
-  them. Cookies become `Secure` automatically when `BETTER_AUTH_URL`
-  uses `https://`.
-- CORS is configured with `credentials: true` and `CLIENT_URL`, so the
-  frontend can send cookies cross-origin.
-- Protected routes call `auth.api.getSession()` with the request headers.
-  Identity always comes from the **verified session**, never from an email
-  in the request body, and requests without a session get **401**.
-- The official BetterAuth **JWT plugin** provides JWT support
-  (`GET /api/auth/token` returns a signed JWT with `sub`, `iss` and `exp`).
+- Every mutation is guarded by `requireAuth` in `auth.js`.
+- The middleware rebuilds the **same** BetterAuth instance against the **same**
+  database and secret, then calls `auth.api.getSession()` with the incoming
+  headers — so the browser's `better-auth.session_token` HTTPOnly cookie is
+  verified here on the API origin.
+- A `Authorization: Bearer <jwt>` header verified against the client's JWKS is
+  kept as a fallback for scripts and older clients.
+- Failures always answer `401 { "message": "Unauthorized" }` as JSON — an
+  invalid token used to throw and leak an HTML stack trace.
+- Identity (`email`, `name`) always comes from the **verified session**, never
+  from the request body, so a caller cannot create records as another user.
+- `isOwner()` enforces ownership before any update, delete or cancel.
+- CORS is restricted to `CLIENT_URL` with `credentials: true`. Cookies are
+  `HttpOnly` + `SameSite=Lax` locally, and switch to `SameSite=None; Secure`
+  automatically when `BETTER_AUTH_URL` is `https://` (required once the client
+  and API are on different domains).
 
-## Booking conflict prevention (double booking)
+## Booking conflict prevention (Challenge 2)
 
-A simple "check then insert" is **not** race safe: two requests could both
-check at the same time, both see a free slot and both insert. This server
-therefore uses two layers:
+Before inserting, the server looks for an existing booking where all of:
 
-1. **Per studio + date lock** – a document with a unique `_id`
-   (`studioId_date`) is inserted into the `bookingLocks` collection.
-   `insertOne` is atomic, so only one request can hold the lock; the others
-   wait and retry. Expired locks (older than 20 s) are removed automatically.
-2. **Overlap check inside the lock** – existing `Pending`/`Confirmed`
-   bookings for the same studio and date are compared with:
+```
+studioId   matches
+bookingDate matches
+status     in ["Pending", "Confirmed"]     // Cancelled frees the slot
+startTime  <  new endTime
+endTime    >  new startTime
+```
 
-   ```
-   newStart < existingEnd  &&  newEnd > existingStart
-   ```
+That is the standard half-open interval overlap test, so touching slots
+(`11:00 → 11:00`) are correctly allowed. A collision answers **409** with
+`"This studio is already booked for this time!"`.
 
-   A match returns **409 Conflict**; non-overlapping (including touching)
-   slots are accepted.
-3. **Transaction** – the check and the insert run inside a MongoDB
-   transaction when the deployment supports it (detected at startup;
-   MongoDB Atlas replica sets do). On standalone MongoDB the server falls
-   back to plain writes, and the lock still serializes the requests.
+Input validation protects the comparison itself: `bookingDate` must be
+`YYYY-MM-DD`, times must be zero-padded `HH:MM` (otherwise the lexical string
+comparison could be bypassed by `9:30`), `endTime` must follow `startTime`, and
+the studio must exist.
 
-Cancelled bookings do not hold their time slot.
+> Known limitation: the check-then-insert is not transactional, so two requests
+> arriving in the same instant could theoretically both pass the check. Making
+> it race-proof requires a MongoDB transaction (available on Atlas replica
+> sets).
 
-## Security notes
+## Input handling
 
-- No credentials or secrets are stored in the repository (`.env` is
-  gitignored, `.env.example` contains placeholders only).
-- Input validation for ids (`ObjectId`), dates (`YYYY-MM-DD`, not in the
-  past), times (`HH:MM`, end after start) and numeric studio fields.
-- Only whitelisted fields can be updated on a studio.
-- Centralized error handler returns safe generic messages.
+- Create and update accept a **field whitelist** — `title`, `category`,
+  `hourlyRate`, `securityDeposit`, `maxCapacity`, `location`, `image`,
+  `gallery`, `amenities`, `overview`. `rating`, `_id`, `ownerEmail` and
+  `ownerName` cannot be mass-assigned, and ownership is never editable.
+- Unknown routes answer JSON `404`; malformed JSON answers `400`; every async
+  rejection is funnelled through one error handler that returns a generic
+  message instead of a stack trace.
