@@ -49,14 +49,18 @@ const wishlistData = db.collection('wishlist');
 // Helpers
 // ---------------------------------------------------------------------------
 
-/** Parses an id param. Answers 400 (not an HTML 500) when it isn't an ObjectId. */
-function parseId(req, res) {
-  const { id } = req.params;
-  if (!ObjectId.isValid(id)) {
+/** Validates an id value. Answers 400 (not an HTML 500) when it isn't an ObjectId. */
+function toObjectId(value, res) {
+  if (!ObjectId.isValid(value)) {
     res.status(400).json({ message: 'Invalid id.' });
     return null;
   }
-  return new ObjectId(id);
+  return new ObjectId(value);
+}
+
+/** Same, reading the id from `req.params.id`. */
+function parseId(req, res) {
+  return toObjectId(req.params.id, res);
 }
 
 // ---------------------------------------------------------------------------
@@ -77,15 +81,19 @@ async function sendCategories(req, res) {
 app.get('/cetagory', sendCategories);
 app.get('/category', sendCategories);
 
-// All studio data + optional category filter + optional limit.
-// `?limit=6` is what the home page's Featured Studios section uses so the
-// server, not the client, truncates the result set.
+// All studio data + optional category filter + optional sort/limit.
+// `?sort=rating&limit=6` is what the home page's Featured Studios section
+// calls, so the server applies MongoDB's `.limit(6)` rather than the browser
+// slicing a full result set.
 app.get('/explore-studios', async (req, res) => {
-  const { category, limit } = req.query;
+  const { category, limit, sort } = req.query;
   const filter = {};
   if (category) filter.category = category;
 
-  let cursor = studiosData.find(filter).sort({ createdAt: -1 });
+  // Newest by default; `sort=rating` returns the top-rated spaces first.
+  const sortSpec = sort === 'rating' ? { rating: -1, createdAt: -1 } : { createdAt: -1 };
+
+  let cursor = studiosData.find(filter).sort(sortSpec);
   const n = Number.parseInt(limit, 10);
   if (Number.isFinite(n) && n > 0) cursor = cursor.limit(n);
 
@@ -103,10 +111,19 @@ app.get('/explore-studios/:id', async (req, res) => {
 });
 
 // Create a studio. Only the whitelisted fields are persisted so a client
-// cannot mass-assign `rating`, `_id`, `email`, etc.
-const STUDIO_FIELDS = [
-  'title', 'category', 'location', 'hourlyRate', 'deposit', 'capacity',
-  'image', 'amenities', 'overview', 'email', 'userName', 'createdAt',
+// cannot mass-assign `rating`, `_id`, `ownerEmail`, etc. Field names mirror
+// studiospace-client/src/lib/types/studio.ts (IStudioPayload).
+const STUDIO_WRITABLE = [
+  'title',
+  'category',
+  'hourlyRate',
+  'securityDeposit',
+  'maxCapacity',
+  'location',
+  'image',
+  'gallery',
+  'amenities',
+  'overview',
 ];
 app.post('/add-studio', requireAuth, async (req, res) => {
   const body = req.body || {};
@@ -115,13 +132,16 @@ app.post('/add-studio', requireAuth, async (req, res) => {
   }
 
   const doc = {};
-  for (const key of STUDIO_FIELDS) {
+  for (const key of STUDIO_WRITABLE) {
     if (body[key] !== undefined) doc[key] = body[key];
   }
-  // The authenticated user is always the owner, whatever the body claimed.
+  // Owner identity always comes from the session, whatever the body claimed.
+  // `email` is the lookup key /my-listing/:email queries on.
   doc.email = req.user.email;
-  doc.userName = req.user.name;
+  doc.ownerEmail = req.user.email;
+  doc.ownerName = req.user.name;
   doc.createdAt = new Date();
+  doc.updatedAt = new Date();
 
   const result = await studiosData.insertOne(doc);
   res.status(201).json(result);
@@ -167,12 +187,15 @@ app.patch('/my-listing-update/:id', requireAuth, async (req, res) => {
 
   const body = req.body || {};
   const updates = {};
-  for (const key of STUDIO_FIELDS) {
-    if (body[key] !== undefined && key !== 'email') updates[key] = body[key];
+  for (const key of STUDIO_WRITABLE) {
+    if (body[key] !== undefined) updates[key] = body[key];
   }
+  // Ownership fields are never editable — otherwise a listing could be
+  // silently transferred to another account.
   if (Object.keys(updates).length === 0) {
     return res.status(400).json({ message: 'No editable fields supplied.' });
   }
+  updates.updatedAt = new Date();
 
   const result = await studiosData.updateOne({ _id: id }, { $set: updates });
   res.json(result);
@@ -189,7 +212,7 @@ app.delete('/my-listing/:email', requireAuth, async (req, res) => {
   }
 
   if (id) {
-    const oid = parseId(req, res);
+    const oid = toObjectId(id, res);
     if (!oid) return;
     const existing = await studiosData.findOne({ _id: oid });
     if (!existing) return res.status(404).json({ message: 'Studio not found.' });
